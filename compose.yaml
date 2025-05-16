@@ -1,0 +1,8 @@
+services:
+  balanz:
+    image: ocpp-2w-proxy
+    restart: always
+    ports:
+      - 8321:8321
+    command: [ "python", "ocpp-2w-proxy", "--url", "wss://abb.cdlink.chargedot.com:9043" ]
+
