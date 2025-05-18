@@ -51,10 +51,13 @@ class OCPP2WProxy:
 
     async def close(self):
         """Close all connections to the charger and primary, secondary server"""
-        await self.ws.close()
-        await self.primary_connection.close()
-        if self.secondary_connection:
-            await self.secondary_connection.close()
+        try:
+            await self.ws.close()
+            await self.primary_connection.close()
+            if self.secondary_connection:
+                await self.secondary_connection.close()
+        except Exception as e:
+            pass # Ignore exceptions
 
     async def check_delete_old(charger_id: str):
         """Check if there are any old instances of this charger in the proxy list"""
@@ -96,10 +99,10 @@ class OCPP2WProxy:
                     additional_headers=headers,
                     subprotocols=subprotocols,
                 )
-                logger.info(f"Connected to secondary server @ {secondary_url}")
+                logger.info(f"{self.charger_id} Connected to secondary server @ {secondary_url}")
             else:
                 self.secondary_connection = None
-                logger.info("Secondary server not enabled")
+                logger.info(f"{self.charger_id} Secondary server not enabled")
             
             # Create tasks to handle the charger. Each task each to handle receiving messages from
             # the charger, and the (one or two) CSMSes, and finally a watch dog task to take down
@@ -113,7 +116,7 @@ class OCPP2WProxy:
 
             # Wait for tasks to complete
             done, pending = await asyncio.wait(self.tasks, return_when=asyncio.FIRST_COMPLETED)
-            logger.debug(f"Task(s) completed for {self.charger_id}: {done}, {pending}")
+            logger.debug(f"{self.charger_id} Task(s) completed: {done}, {pending}")
 
             for task in done:
                 e = task.exception()
@@ -133,8 +136,8 @@ class OCPP2WProxy:
         except Exception as e:
             logging.error(f"{self.charger_id} Unexpected error: {e}")
         finally:
-            logging.info(f"{self.charger_id} Closing connections')
-
+            # Always close stuff. close is well tempered, so can close even if not stablished
+            await self.close()
 
     async def receive_charger_messages(self):
         try:
@@ -143,7 +146,7 @@ class OCPP2WProxy:
                 message = await self.charger_connection.receive()
                 # Process the received message
                 # TODO - more logic. type of message, etc
-                logging.info("^[" + self.charger_id + "] " + message)
+                logging.info(f"{self.charger_id} ^ : {message}")
                 await self.primary_connection.send(message)
                 if self.secondary_connection:
                     await self.secondary_connection.send(message)
@@ -157,7 +160,10 @@ class OCPP2WProxy:
                 # Wait for a message from the primary server
                 # TODO: more logic
                 message = await self.primary_connection.receive()
-                logging.info("v 1[" + self.charger_id + "] " + message)
+                logging.info(f"{self.charger_id} v (prim) : {message}")
+                # Send it to the charger
+                # TODO: more logic, like type of message, etc
+
                 # Process the received message
                 await self.charger_connection.send(message)
 
@@ -169,7 +175,7 @@ class OCPP2WProxy:
             while True:
                 # Wait for a message from the secondary server
                 message = await self.secondary_connection.receive()
-                logging.info("v 2[" + self.charger_id + "] " + message)
+                logging.info(f"{self.charger_id} v (sec) : {message}")
                 # Process the received message
                 # TODO
                 await self.charger_connection.send(message)
@@ -178,23 +184,23 @@ class OCPP2WProxy:
             pass
 
     async def watchdog(self):
-        """Watch time vs. timestamp updated by receiving messages cp."""
+        """Watch time vs. timestamp updated by receiving messages from charger."""
         while True:
             # And ... sleep
             await asyncio.sleep(config.getint("host", "watchdog_interval", 30))
 
             elapsed = time.time() - self._last_charger_update
             if elapsed > config.getint("host", "watchdog_stale", 300):
-                logger.error(f"{self.charger_id}: Watch dog no for {elapsed} seconds. Closing connections")
+                logger.error(f"{self.charger_id} Watch dog no for {elapsed} seconds. Closing connections")
                 return
 
 # Connection handler (charger connects)
 async def on_connect(websocket: websockets.asyncio.server.ServerConnection):
-    logger.debug('Connection request')
+    logger.debug('Connection request', websocket.request)
     # Determine charger_id (final part of path)
     path = websocket.request.path
     charger_id = path.strip("/")
-    logger.info(f'Connection from {charger_id}')
+    logger.info(f'{charger_id} connection request')
 
     try:
         # Delete any existing charger setup
@@ -202,16 +208,14 @@ async def on_connect(websocket: websockets.asyncio.server.ServerConnection):
 
         # Setup
         proxy = OCPP2WProxy(websocket=websocket, charger_id=charger_id)
-        await proxy.setup(
 
         # Connect and run proxy operations
         await proxy.run()
 
     except Exception as e:
-        logger.error(f'Error creating OCPP2WProxy. {e}')
+        logger.error(f'{charger_id} Error creating OCPP2WProxy: {e}')
     finally:
-        logger.info("Connection closed.")
-
+        logger.info("f{charger_id} closed/done")
 
 
 # Main. Decode arguments, setup handler
@@ -231,10 +235,6 @@ async def main():
     # Read config. config object is then available (via config import) to all.
     logger.warning(f"Reading config from {args.config}")
     config.read(args.config)
-
-    if not url:
-        logging.error("No --url argument supplied. Exiting.")
-        return
 
     host = args.host
     tls_host = args.tls_host
