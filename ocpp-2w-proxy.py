@@ -4,6 +4,8 @@
 import asyncio
 import logging
 import time
+from typing import Tuple, List
+import json
 
 import websockets
 import websockets.asyncio
@@ -11,6 +13,7 @@ import websockets.asyncio.server
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError
 from websockets.frames import CloseCode
 
+from enum import IntEnum
 import ssl
 from pathlib import Path
 import argparse
@@ -26,10 +29,21 @@ logger = logging.getLogger("proxy")
 class OCPP2WProxy: # Forward declaration
     pass
 
+class OCPPMessageType(IntEnum):
+    Call = 2
+    CallResult = 3
+    CallError = 4
+
 # main class
 class OCPP2WProxy:
     # Static dict of OCPP2WProxy instances. key is charger_id
     proxy_list: dict[OCPP2WProxy] = {}
+
+    # Utility functions
+    def decode_ocpp_message(message: str) -> Tuple[OCPPMessageType, str]:
+        """Decode an OCPP message from a string"""
+        j = json.loads(message)
+        return [j[0], j[1]]
 
     def __init__(self, websocket: websockets.asyncio.server.ServerConnection, charger_id: str):
         # Store the websocket for later     
@@ -43,8 +57,8 @@ class OCPP2WProxy:
             raise Exception("Charger ID is not alphanumeric")
 
         # Initialize table of CSMS call ids sent to the charger in order to respond back 
-        # (only) to the CSMS that issued the call
-        self.call_ids: dict[str, str] = {}
+        self.primary_call_ids = set()
+        self.secondary_call_ids = set()
 
         # Insert new OCPP2WProxy instance in the (static) dict of instances.
         self.proxy_list[charger_id] = self
@@ -149,31 +163,47 @@ class OCPP2WProxy:
                 # Wait for a message from the charger
                 message = await self.ws.recv()
                 # Process the received message
-                # TODO - more logic. type of message, etc
                 logging.info(f"{self.charger_id} ^ : {message}")
-                await self.primary_connection.send(message)
-                if self.secondary_connection:
-                    await self.secondary_connection.send(message)
 
-        except ConnectionClosed:
-            pass
+                # Now, if this is an OCPP CallResult (3) or CallError (4), we need to send it back to the 
+                # CSMS (primary or secondary) that issued the command
+                [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
+
+                # If it is a Call (2), we will send it to both primary and secondary (if connected)
+                if message_type == OCPPMessageType.Call:
+                    await self.primary_connection.send(message)
+                    if self.secondary_connection:
+                        await self.secondary_connection.send(message)
+                elif message_type == OCPPMessageType.CallResult or message_type == OCPPMessageType.CallError:
+                    if message_id in self.primary_call_ids:
+                        self.primary_call_ids.remove(message_id)
+                        await self.primary_connection.send(message)
+                    elif message_id in self.secondary_call_ids:
+                        self.secondary_call_ids.remove(message_id)
+                        await self.secondary_connection.send(message)
+                    else:
+                        logger.error(f"{self.charger_id} ^: Received CallResult/CallError against unknown message id {message_id}")
+                else:
+                    logger.error(f"{self.charger_id} ^: Unknown message type {message_type}")
+        except Exception as e:
+            logging.error(f"{self.charger_id} Error in receive_charger_messages: {e}")
 
     async def receive_primary_messages(self):
         try:
             while True:
                 # Wait for a message from the primary server
-                # TODO: more logic
                 message = await self.primary_connection.recv()
                 logging.info(f"{self.charger_id} v (prim) : {message}")
-                # Send it to the charger
-                # TODO: more logic, like type of message, etc
 
-                # Process the received message
+                [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
+                if message_type == OCPPMessageType.Call:
+                    # Record the message_id 
+                    self.primary_call_ids.add(message_id)
+
+                # Send message to the charger
                 await self.ws.send(message)
-
         except Exception as e:
-            logging.error(f"Error in receive_primary_messages: {e}")
-
+            logging.error(f"{self.charger_id} Error in receive_primary_messages: {e}")
 
     async def receive_secondary_messages(self):
         try:
@@ -181,12 +211,17 @@ class OCPP2WProxy:
                 # Wait for a message from the secondary server
                 message = await self.secondary_connection.recv()
                 logging.info(f"{self.charger_id} v (sec) : {message}")
-                # Process the received message
-                # TODO
-                await self.ws.send(message)
 
-        except ConnectionClosed:
-            pass
+                [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
+                if message_type == OCPPMessageType.Call:
+                    # Record the message_id 
+                    self.secondary_call_ids.add(message_id)
+                    # Send it to the charger
+                    await self.ws.send(message) 
+                # Note! We do not forward CallResults or CallErrors from the secondary server
+                # These are silently ignored.
+        except Exception as e:
+            logging.error(f"{self.charger_id} Error in receive_primary_messages: {e}")
 
     async def watchdog(self):
         """Watch time vs. timestamp updated by receiving messages from charger."""
