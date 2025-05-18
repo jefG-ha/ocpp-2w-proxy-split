@@ -4,5 +4,5 @@ services:
     restart: always
     ports:
       - 8321:8321
-    command: [ "python", "ocpp-2w-proxy"]
+    command: [ "python", "ocpp-2w-proxy.py"]
 
