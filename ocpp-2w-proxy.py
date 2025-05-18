@@ -3,6 +3,7 @@
 
 import asyncio
 import logging
+import time
 
 import websockets
 import websockets.asyncio
@@ -99,57 +100,93 @@ class OCPP2WProxy:
             else:
                 self.secondary_connection = None
                 logger.info("Secondary server not enabled")
+            
+            # Create tasks to handle the charger. Each task each to handle receiving messages from
+            # the charger, and the (one or two) CSMSes, and finally a watch dog task to take down
+            # connections if connection goes stale.
+            self.tasks = []
+            self.tasks.append(asyncio.create_task(self.receive_charger_messages()))
+            self.tasks.append(asyncio.create_task(self.receive_primary_messages()))
+            if self.secondary_connection is not None:
+                self.tasks.append(asyncio.create_task(self.receive_secondary_messages()))
+            self.tasks.append(asyncio.create_task(self.watchdog()))
 
+            # Wait for tasks to complete
+            done, pending = await asyncio.wait(self.tasks, return_when=asyncio.FIRST_COMPLETED)
+            logger.debug(f"Task(s) completed for {self.charger_id}: {done}, {pending}")
+
+            for task in done:
+                e = task.exception()
+                if e:
+                    logger.warning(f"{self.charger_id} (Not serious - likely connection loss) Task {task} raised exception {e} related to charger ")
+
+            # Cancel any remaining tasks
+            for task in pending:
+                task.cancel()
+
+        except websockets.exceptions.InvalidURI:
+            logging.error(f"{self.charger_id} Invalid URI")
+        except websockets.exceptions.ConnectionClosedError as e:
+            logging.error(f"{self.charger_id} Connection closed unexpectedly: {e}")
+        except websockets.exceptions.InvalidHandshake:
+            logging.error(f"{self.charger_id} Handshake with the external server failed")
         except Exception as e:
-            logger.error(f"Failed to connected to upstream server(s): {e}")
-            return await self.ws.close(CloseCode.ABNORMAL_CLOSURE, "Failed to connect to upstream server(s)")
-        
-        # Create tasks to handle the charger. Each task each to handle receiving messages from
-        # the charger, and the (one or two) CSMSes, and finally a watch dog task to take down
-        # connections if connection goes stale.
-        self.tasks = []
-        self.tasks.append(asyncio.create_task(self.receive_charger_messages()))
-        self.tasks.append(asyncio.create_task(self.receive_primary_messages()))
-        if self.secondary_connection is not None:
-            self.tasks.append(asyncio.create_task(self.receive_secondary_messages()))
-        self.tasks.append(asyncio.create_task(self.watchdog()))
-
-        # Wait for tasks to complete
-        done, pending = await asyncio.wait(self.tasks, return_when=asyncio.FIRST_COMPLETED)
-        logger.debug(f"Task(s) completed for {self.charger_id}: {done}, {pending}")
-
-        for task in done:
-            e = task.exception()
-            if e:
-                logger.warning(f"{self.charger_id} (Not serious - likely connection loss) Task {task} raised exception {e} related to charger ")
-
-        # Cancel any remaining tasks
-        for task in pending:
-            task.cancel()
+            logging.error(f"{self.charger_id} Unexpected error: {e}")
+        finally:
+            logging.info(f"{self.charger_id} Closing connections')
 
 
-    
+    async def receive_charger_messages(self):
+        try:
+            while True:
+                # Wait for a message from the charger
+                message = await self.charger_connection.receive()
+                # Process the received message
+                # TODO - more logic. type of message, etc
+                logging.info("^[" + self.charger_id + "] " + message)
+                await self.primary_connection.send(message)
+                if self.secondary_connection:
+                    await self.secondary_connection.send(message)
 
+        except ConnectionClosed:
+            pass
 
+    async def receive_primary_messages(self):
+        try:
+            while True:
+                # Wait for a message from the primary server
+                # TODO: more logic
+                message = await self.primary_connection.receive()
+                logging.info("v 1[" + self.charger_id + "] " + message)
+                # Process the received message
+                await self.charger_connection.send(message)
 
+        except ConnectionClosed:
+            pass
 
-# Forward traffic from server (portal).
-async def forward_from_server(client_ws, server_ws, path):
-    try:
-        async for message in server_ws:
-            logging.info("v[" + path + "] " + message)
-            await client_ws.send(message)
-    except ConnectionClosed:
-        pass
+    async def receive_secondary_messages(self):
+        try:
+            while True:
+                # Wait for a message from the secondary server
+                message = await self.secondary_connection.receive()
+                logging.info("v 2[" + self.charger_id + "] " + message)
+                # Process the received message
+                # TODO
+                await self.charger_connection.send(message)
 
-# Forward traffic from client (charger).
-async def forward_from_client(client_ws, server_ws, path):
-    try:
-        async for message in client_ws:
-            logging.info("^[" + path + "] " + message)
-            await server_ws.send(message)
-    except ConnectionClosed:
-        pass
+        except ConnectionClosed:
+            pass
+
+    async def watchdog(self):
+        """Watch time vs. timestamp updated by receiving messages cp."""
+        while True:
+            # And ... sleep
+            await asyncio.sleep(config.getint("host", "watchdog_interval", 30))
+
+            elapsed = time.time() - self._last_charger_update
+            if elapsed > config.getint("host", "watchdog_stale", 300):
+                logger.error(f"{self.charger_id}: Watch dog no for {elapsed} seconds. Closing connections")
+                return
 
 # Connection handler (charger connects)
 async def on_connect(websocket: websockets.asyncio.server.ServerConnection):
@@ -175,51 +212,6 @@ async def on_connect(websocket: websockets.asyncio.server.ServerConnection):
     finally:
         logger.info("Connection closed.")
 
-
-
-
-
-
-
-    # Establish ws/wss connection to URL.
-    portal_uri = url + "/" + charge_point_id
-    #requested_protocols = websocket.request.headers["Sec-WebSocket-Protocol"].split(",")  # This seems to not work. Keeping for history
-    requested_protocols = ['ocpp1.6']   
-    logging.info(f'Establishing connection to upstream URL @ {portal_uri}. Protocol is {requested_protocols}')
-
-
-    try:
-        async with websockets.connect(uri = portal_uri, subprotocols=requested_protocols, ssl = True) as server_ws:
-            # Two tasks: forward data both ways
-            forward_server_to_client = await asyncio.create_task(forward_from_server(websocket, server_ws, path))
-            forward_client_to_server = await asyncio.create_task(forward_from_client(websocket, server_ws, path))
-
-            # Wait for both tasks to complete
-            done, pending = await asyncio.wait(
-                [forward_client_to_server, forward_server_to_client],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-
-            # Cancel any remaining tasks
-            for task in pending:
-                task.cancel()
-
-    except websockets.exceptions.InvalidURI:
-        logging.error(f"Invalid URI: {portal_uri}")
-        await client_ws.close(reason="Invalid server URI")
-    except websockets.exceptions.ConnectionClosedError as e:
-        logging.error(f"Connection closed unexpectedly: {e}")
-        await client_ws.close(reason="External server connection closed")
-    except websockets.exceptions.InvalidHandshake:
-        logging.error("Handshake with the external server failed")
-        await client_ws.close(reason="Failed handshake with external server")
-    except Exception as e:
-        logging.error(f"Unexpected error: {e}")
-        await client_ws.close(reason="Unexpected server error")      
-    finally:
-        logging.info(f'Closing connection for {path}')
-        active_client_connections.pop(path, None)
-        await client_ws.close(reason="Proxy shutting down")  
 
 
 # Main. Decode arguments, setup handler
