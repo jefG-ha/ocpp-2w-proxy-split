@@ -21,7 +21,7 @@ __version__ = "0.1.0"
 config = configparser.ConfigParser()
 
 logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', level=logging.DEBUG, datefmt='%Y-%m-%d %H:%M:%S')
-logger = logging.getLogger("OCPP2WProxy")
+logger = logging.getLogger("proxy")
 
 class OCPP2WProxy: # Forward declaration
     pass
@@ -31,7 +31,7 @@ class OCPP2WProxy:
     # Static dict of OCPP2WProxy instances. key is charger_id
     proxy_list: dict[OCPP2WProxy] = {}
 
-    def __init__(self, websocket: websockets.server.WebSocketServerProtocol, charger_id: str):
+    def __init__(self, websocket: websockets.asyncio.server.ServerConnection, charger_id: str):
         # Store the websocket for later     
         logger.debug(websocket.request)
         self.ws = websocket
@@ -78,26 +78,29 @@ class OCPP2WProxy:
             logger.debug(f'Authorization header set to {headers["Authorization"]}')
         user_agent = self.ws.request.headers.get("User-Agent", None) 
         subprotocols = self.ws.request.headers.get("Sec-WebSocket-Protocol", ["ocpp1.6"])
-        primary_url = config.primary_server + "/" + self.charger_id
-        if config.secondary_server:
-            secondary_url = config.secondary_server + "/" + self.charger_id
+        primary_url = config.get("ext-server", "server") + "/" + self.charger_id
+        if config.has_option("ext-server", "secondary_server"):
+            secondary_url = config.get("ext-server", "secondary_server") + "/" + self.charger_id
+        else:
+            secondary_url = None    
 
         try:
+            logger.debug(subprotocols)
             self.primary_connection = await websockets.connect(
                 uri=primary_url,
                 user_agent_header=user_agent,
                 additional_headers=headers,
-                subprotocols=subprotocols,
+                subprotocols=[subprotocols],
             )
             logger.info(f"Connected to primary server @ {primary_url}")
 
             # Connect to secondary server if it is enabled.
-            if config.secondary_server:
+            if secondary_url:
                 self.secondary_connection = await websockets.connect(
                     uri=secondary_url,
                     user_agent_header=user_agent,
                     additional_headers=headers,
-                    subprotocols=subprotocols,
+                    subprotocols=[subprotocols],
                 )
                 logger.info(f"{self.charger_id} Connected to secondary server @ {secondary_url}")
             else:
@@ -107,12 +110,13 @@ class OCPP2WProxy:
             # Create tasks to handle the charger. Each task each to handle receiving messages from
             # the charger, and the (one or two) CSMSes, and finally a watch dog task to take down
             # connections if connection goes stale.
+            self._last_charger_update = time.time()
             self.tasks = []
             self.tasks.append(asyncio.create_task(self.receive_charger_messages()))
             self.tasks.append(asyncio.create_task(self.receive_primary_messages()))
             if self.secondary_connection is not None:
                 self.tasks.append(asyncio.create_task(self.receive_secondary_messages()))
-            self.tasks.append(asyncio.create_task(self.watchdog()))
+            #self.tasks.append(asyncio.create_task(self.watchdog()))
 
             # Wait for tasks to complete
             done, pending = await asyncio.wait(self.tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -143,7 +147,7 @@ class OCPP2WProxy:
         try:
             while True:
                 # Wait for a message from the charger
-                message = await self.charger_connection.receive()
+                message = await self.ws.recv()
                 # Process the received message
                 # TODO - more logic. type of message, etc
                 logging.info(f"{self.charger_id} ^ : {message}")
@@ -159,26 +163,27 @@ class OCPP2WProxy:
             while True:
                 # Wait for a message from the primary server
                 # TODO: more logic
-                message = await self.primary_connection.receive()
+                message = await self.primary_connection.recv()
                 logging.info(f"{self.charger_id} v (prim) : {message}")
                 # Send it to the charger
                 # TODO: more logic, like type of message, etc
 
                 # Process the received message
-                await self.charger_connection.send(message)
+                await self.ws.send(message)
 
-        except ConnectionClosed:
-            pass
+        except Exception as e:
+            logging.error(f"Error in receive_primary_messages: {e}")
+
 
     async def receive_secondary_messages(self):
         try:
             while True:
                 # Wait for a message from the secondary server
-                message = await self.secondary_connection.receive()
+                message = await self.secondary_connection.recv()
                 logging.info(f"{self.charger_id} v (sec) : {message}")
                 # Process the received message
                 # TODO
-                await self.charger_connection.send(message)
+                await self.ws.send(message)
 
         except ConnectionClosed:
             pass
@@ -204,7 +209,9 @@ async def on_connect(websocket: websockets.asyncio.server.ServerConnection):
 
     try:
         # Delete any existing charger setup
-        await OCPP2WProxy.delete_charger_setup(charger_id)
+        if charger_id in OCPP2WProxy.proxy_list:
+            await OCPP2WProxy.proxy_list[charger_id].close()
+            del OCPP2WProxy.proxy_list[charger_id]
 
         # Setup
         proxy = OCPP2WProxy(websocket=websocket, charger_id=charger_id)
@@ -227,7 +234,7 @@ async def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="ocpp2-2w-proxy.ini",
+        default="ocpp-2w-proxy.ini",
         help="Configuration file (INI format). Default ocpp-2w-proxy.ini",
     )
     args = parser.parse_args()
@@ -236,26 +243,37 @@ async def main():
     logger.warning(f"Reading config from {args.config}")
     config.read(args.config)
 
-    host = args.host
-    tls_host = args.tls_host
-    if not tls_host:
-        tls_host = host
+    # Adjust log levels
+    for logger_name in config["logging"]:
+        logger.warning(f'Setting log level for {logger_name} to {config.get("logging", logger_name)}')
+        logging.getLogger(logger_name).setLevel(level=config.get("logging", logger_name))
 
-    port = args.port
-    tls_port = args.tls_port
+    # Get host config
+    host = config.get("host", "addr")
+    port = config.get("host", "port")
+    cert_chain = config.get("host", "cert_chain", fallback=None)
+    cert_key = config.get("host", "cert_key", fallback=None)
+    logger.debug(f"host: {host}, port: {port}, cert_chain: {cert_chain}, cert_key: {cert_key}")
 
-    cert_chain = args.cert_chain
-
-    tls_server = None
-    if cert_chain:
+    # Start server, either ws:// or wss://
+    if cert_chain and cert_key:
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_context.load_cert_chain(cert_chain)
+        ssl_context.load_cert_chain(certfile=cert_chain, keyfile=cert_key)
         server = await websockets.serve(
-            on_connect, tls_host, tls_port,subprotocols=["ocpp1.6", "ocpp2.0.1"], ssl=ssl_context
+            on_connect,
+            host,
+            port,
+            subprotocols=["ocpp1.6", "ocpp2.0.1"],
+            ssl=ssl_context,
+            ping_timeout=config.getint("host", "ping_timeout"),
         )
     else:
         server = await websockets.serve(
-            on_connect, host, port, subprotocols=["ocpp1.6", "ocpp2.0.1"]
+            on_connect,
+            host,
+            port,
+            subprotocols=["ocpp1.6", "ocpp2.0.1"],
+            ping_timeout=config.getint("host", "ping_timeout"),
         )
 
     logging.info("Proxy ready. Waiting for new connections...")
