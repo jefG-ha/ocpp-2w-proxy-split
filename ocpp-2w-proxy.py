@@ -23,7 +23,10 @@ __version__ = "0.1.0"
 
 config = configparser.ConfigParser()
 
-logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', level=logging.DEBUG, datefmt='%Y-%m-%d %H:%M:%S')
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 logger = logging.getLogger("proxy")
 
 class OCPP2WProxy: # Forward declaration
@@ -99,7 +102,6 @@ class OCPP2WProxy:
             secondary_url = None    
 
         try:
-            logger.debug(subprotocols)
             self.primary_connection = await websockets.connect(
                 uri=primary_url,
                 user_agent_header=user_agent,
