@@ -176,9 +176,11 @@ class OCPP2WProxy:
                         await self.secondary_connection.send(message)
                 elif message_type == OCPPMessageType.CallResult or message_type == OCPPMessageType.CallError:
                     if message_id in self.primary_call_ids:
+                        logging.info(f"{self.charger_id} ^ : Result/Error forwarded to primary")
                         self.primary_call_ids.remove(message_id)
                         await self.primary_connection.send(message)
                     elif message_id in self.secondary_call_ids:
+                        logging.info(f"{self.charger_id} ^ : Result/Error forwarded to secondary")
                         self.secondary_call_ids.remove(message_id)
                         await self.secondary_connection.send(message)
                     else:
