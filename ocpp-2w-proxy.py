@@ -77,7 +77,7 @@ class OCPP2WProxy:
     async def check_delete_old(charger_id: str):
         """Check if there are any old instances of this charger in the proxy list"""
         if charger_id in OCPP2WProxy.proxy_list:
-            logger.info(f"Charger ID {self.charger_id} already exists. Closing and deleting")
+            logger.info(f"Charger ID {charger_id} already exists. Closing and deleting")
             proxy: OCPP2WProxy = OCPP2WProxy.proxy_list[charger_id]
             await proxy.close()
             del OCPP2WProxy.proxy_list[charger_id]
