@@ -281,7 +281,7 @@ async def main():
     config.read(args.config)
 
     # Adjust log levels
-    for logger_name in config["logger"]:
+    for logger_name in config["logging"]:
         logger.warning(f'Setting log level for {logger_name} to {config.get("logging", logger_name)}')
         logging.getLogger(logger_name).setLevel(level=config.get("logging", logger_name))
 
