@@ -146,13 +146,13 @@ class OCPP2WProxy:
                 task.cancel()
 
         except websockets.exceptions.InvalidURI:
-            logging.error(f"{self.charger_id} Invalid URI")
+            logger.error(f"{self.charger_id} Invalid URI")
         except websockets.exceptions.ConnectionClosedError as e:
-            logging.error(f"{self.charger_id} Connection closed unexpectedly: {e}")
+            logger.error(f"{self.charger_id} Connection closed unexpectedly: {e}")
         except websockets.exceptions.InvalidHandshake:
-            logging.error(f"{self.charger_id} Handshake with the external server failed")
+            logger.error(f"{self.charger_id} Handshake with the external server failed")
         except Exception as e:
-            logging.error(f"{self.charger_id} Unexpected error: {e}")
+            logger.error(f"{self.charger_id} Unexpected error: {e}")
         finally:
             # Always close stuff. close is well tempered, so can close even if not stablished
             await self.close()
@@ -163,7 +163,7 @@ class OCPP2WProxy:
                 # Wait for a message from the charger
                 message = await self.ws.recv()
                 # Process the received message
-                logging.info(f"{self.charger_id} ^ : {message}")
+                logger.info(f"{self.charger_id} ^ : {message}")
 
                 # Now, if this is an OCPP CallResult (3) or CallError (4), we need to send it back to the 
                 # CSMS (primary or secondary) that issued the command
@@ -176,11 +176,11 @@ class OCPP2WProxy:
                         await self.secondary_connection.send(message)
                 elif message_type == OCPPMessageType.CallResult or message_type == OCPPMessageType.CallError:
                     if message_id in self.primary_call_ids:
-                        logging.info(f"{self.charger_id} ^ : Result/Error forwarded to primary")
+                        logger.info(f"{self.charger_id} ^ : Result/Error forwarded to primary")
                         self.primary_call_ids.remove(message_id)
                         await self.primary_connection.send(message)
                     elif message_id in self.secondary_call_ids:
-                        logging.info(f"{self.charger_id} ^ : Result/Error forwarded to secondary")
+                        logger.info(f"{self.charger_id} ^ : Result/Error forwarded to secondary")
                         self.secondary_call_ids.remove(message_id)
                         await self.secondary_connection.send(message)
                     else:
@@ -188,14 +188,14 @@ class OCPP2WProxy:
                 else:
                     logger.error(f"{self.charger_id} ^: Unknown message type {message_type}")
         except Exception as e:
-            logging.error(f"{self.charger_id} Error in receive_charger_messages: {e}")
+            logger.error(f"{self.charger_id} Error in receive_charger_messages: {e}")
 
     async def receive_primary_messages(self):
         try:
             while True:
                 # Wait for a message from the primary server
                 message = await self.primary_connection.recv()
-                logging.info(f"{self.charger_id} v (prim) : {message}")
+                logger.info(f"{self.charger_id} v (prim) : {message}")
 
                 [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
                 if message_type == OCPPMessageType.Call:
@@ -205,14 +205,14 @@ class OCPP2WProxy:
                 # Send message to the charger
                 await self.ws.send(message)
         except Exception as e:
-            logging.error(f"{self.charger_id} Error in receive_primary_messages: {e}")
+            logger.error(f"{self.charger_id} Error in receive_primary_messages: {e}")
 
     async def receive_secondary_messages(self):
         try:
             while True:
                 # Wait for a message from the secondary server
                 message = await self.secondary_connection.recv()
-                logging.info(f"{self.charger_id} v (sec) : {message}")
+                logger.info(f"{self.charger_id} v (sec) : {message}")
 
                 [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
                 if message_type == OCPPMessageType.Call:
@@ -223,7 +223,7 @@ class OCPP2WProxy:
                 # Note! We do not forward CallResults or CallErrors from the secondary server
                 # These are silently ignored.
         except Exception as e:
-            logging.error(f"{self.charger_id} Error in receive_primary_messages: {e}")
+            logger.error(f"{self.charger_id} Error in receive_primary_messages: {e}")
 
     async def watchdog(self):
         """Watch time vs. timestamp updated by receiving messages from charger."""
@@ -281,7 +281,7 @@ async def main():
     config.read(args.config)
 
     # Adjust log levels
-    for logger_name in config["logging"]:
+    for logger_name in config["logger"]:
         logger.warning(f'Setting log level for {logger_name} to {config.get("logging", logger_name)}')
         logging.getLogger(logger_name).setLevel(level=config.get("logging", logger_name))
 
@@ -313,7 +313,7 @@ async def main():
             ping_timeout=config.getint("host", "ping_timeout"),
         )
 
-    logging.info("Proxy ready. Waiting for new connections...")
+    logger.info("Proxy ready. Waiting for new connections...")
     await server.wait_closed()
 
 
