@@ -1,21 +1,17 @@
-# websocket proxy
-# To later be expanded with OCPP capabilities in order to handle local smart charging.
+# 2 way OCPP proxy (can also be used as a 1-way simple proxy)
 
 import asyncio
 import logging
 import time
-from typing import Tuple, List
+from typing import Tuple
 import json
 
 import websockets
 import websockets.asyncio
 import websockets.asyncio.server
-from websockets.exceptions import ConnectionClosed, ConnectionClosedError
-from websockets.frames import CloseCode
 
 from enum import IntEnum
 import ssl
-from pathlib import Path
 import argparse
 import configparser
 
@@ -40,9 +36,10 @@ class OCPPMessageType(IntEnum):
 # main class
 class OCPP2WProxy:
     # Static dict of OCPP2WProxy instances. key is charger_id
-    proxy_list: dict[OCPP2WProxy] = {}
+    proxy_list: dict[str, OCPP2WProxy] = {}
 
     # Utility functions
+    @staticmethod
     def decode_ocpp_message(message: str) -> Tuple[OCPPMessageType, str]:
         """Decode an OCPP message from a string"""
         j = json.loads(message)
@@ -76,11 +73,12 @@ class OCPP2WProxy:
         except Exception as e:
             pass # Ignore exceptions
 
+    @staticmethod
     async def check_delete_old(charger_id: str):
         """Check if there are any old instances of this charger in the proxy list"""
         if charger_id in OCPP2WProxy.proxy_list:
             logger.info(f"Charger ID {self.charger_id} already exists. Closing and deleting")
-            proxy = OCPP2WProxy.proxy_list[charger_id]
+            proxy: OCPP2WProxy = OCPP2WProxy.proxy_list[charger_id]
             await proxy.close()
             del OCPP2WProxy.proxy_list[charger_id]
 
