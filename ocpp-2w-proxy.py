@@ -15,7 +15,7 @@ import ssl
 import argparse
 import configparser
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 config = configparser.ConfigParser()
 
@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("proxy")
 
-class OCPP2WProxy: # Forward declaration
+class OCPP2WProxy:  # Forward declaration
     pass
 
 class OCPPMessageType(IntEnum):
@@ -36,32 +36,37 @@ class OCPPMessageType(IntEnum):
 # main class
 class OCPP2WProxy:
     # Static dict of OCPP2WProxy instances. key is charger_id
-    proxy_list: dict[str, OCPP2WProxy] = {}
+    proxy_list: dict[str, "OCPP2WProxy"] = {}
 
     # Utility functions
     @staticmethod
-    def decode_ocpp_message(message: str) -> Tuple[OCPPMessageType, str]:
+    def decode_ocpp_message(message: str) -> Tuple[int, str]:
         """Decode an OCPP message from a string"""
         j = json.loads(message)
         return [j[0], j[1]]
 
     def __init__(self, websocket: websockets.asyncio.server.ServerConnection, charger_id: str):
-        # Store the websocket for later     
+        # Store the websocket for later
         logger.debug(websocket.request)
         self.ws = websocket
         self.charger_id = charger_id
 
-        # Chech that charger id looks reasonable
+        # Check that charger id looks reasonable
         if not charger_id.isalnum():
             logger.error(f"Charger ID '{charger_id}' is not alphanumeric")
             raise Exception("Charger ID is not alphanumeric")
 
-        # Initialize table of CSMS call ids sent to the charger in order to respond back 
+        # Initialize table of CSMS call ids sent to the charger in order to respond back
         self.primary_call_ids = set()
         self.secondary_call_ids = set()
 
         # Insert new OCPP2WProxy instance in the (static) dict of instances.
         self.proxy_list[charger_id] = self
+
+        # RFID config and routing state
+        self.primary_rfid = config.get("ext-server", "primary_rfid", fallback=None)
+        self.secondary_rfid = config.get("ext-server", "secondary_rfid", fallback=None)
+        self.session_target = None  # "primary" or "secondary"
 
     async def close(self):
         """Close all connections to the charger and primary, secondary server"""
@@ -70,8 +75,8 @@ class OCPP2WProxy:
             await self.primary_connection.close()
             if self.secondary_connection:
                 await self.secondary_connection.close()
-        except Exception as e:
-            pass # Ignore exceptions
+        except Exception:
+            pass  # Ignore exceptions
 
     @staticmethod
     async def check_delete_old(charger_id: str):
@@ -86,18 +91,17 @@ class OCPP2WProxy:
         """Main loop for this proxy. This is where all the magic happens."""
 
         # Create connections to the two CSMSes.
-        # Forward any available Authorization and User-Agent headers
         headers = {}
         if "Authorization" in self.ws.request.headers:
             headers["Authorization"] = self.ws.request.headers["Authorization"]
             logger.debug(f'Authorization header set to {headers["Authorization"]}')
-        user_agent = self.ws.request.headers.get("User-Agent", None) 
+        user_agent = self.ws.request.headers.get("User-Agent", None)
         subprotocols = self.ws.request.headers.get("Sec-WebSocket-Protocol", ["ocpp1.6"])
         primary_url = config.get("ext-server", "server") + "/" + self.charger_id
         if config.has_option("ext-server", "secondary_server"):
             secondary_url = config.get("ext-server", "secondary_server") + "/" + self.charger_id
         else:
-            secondary_url = None    
+            secondary_url = None
 
         try:
             self.primary_connection = await websockets.connect(
@@ -108,7 +112,6 @@ class OCPP2WProxy:
             )
             logger.info(f"Connected to primary server @ {primary_url}")
 
-            # Connect to secondary server if it is enabled.
             if secondary_url:
                 self.secondary_connection = await websockets.connect(
                     uri=secondary_url,
@@ -120,28 +123,27 @@ class OCPP2WProxy:
             else:
                 self.secondary_connection = None
                 logger.info(f"{self.charger_id} Secondary server not enabled")
-            
-            # Create tasks to handle the charger. Each task each to handle receiving messages from
-            # the charger, and the (one or two) CSMSes, and finally a watch dog task to take down
-            # connections if connection goes stale.
+
+            # Create tasks
             self._last_charger_update = time.time()
             self.tasks = []
             self.tasks.append(asyncio.create_task(self.receive_charger_messages()))
             self.tasks.append(asyncio.create_task(self.receive_primary_messages()))
             if self.secondary_connection is not None:
                 self.tasks.append(asyncio.create_task(self.receive_secondary_messages()))
-            #self.tasks.append(asyncio.create_task(self.watchdog()))
+            # self.tasks.append(asyncio.create_task(self.watchdog()))
 
-            # Wait for tasks to complete
+            # Wait for tasks
             done, pending = await asyncio.wait(self.tasks, return_when=asyncio.FIRST_COMPLETED)
             logger.debug(f"{self.charger_id} Task(s) completed: {done}, {pending}")
 
             for task in done:
                 e = task.exception()
                 if e:
-                    logger.warning(f"{self.charger_id} (Not serious - likely connection loss) Task {task} raised exception {e} related to charger ")
+                    logger.warning(
+                        f"{self.charger_id} Task {task} raised exception {e} (likely connection loss)"
+                    )
 
-            # Cancel any remaining tasks
             for task in pending:
                 task.cancel()
 
@@ -154,27 +156,42 @@ class OCPP2WProxy:
         except Exception as e:
             logger.error(f"{self.charger_id} Unexpected error: {e}")
         finally:
-            # Always close stuff. close is well tempered, so can close even if not stablished
             await self.close()
 
     async def receive_charger_messages(self):
         try:
             while True:
-                # Wait for a message from the charger
                 message = await self.ws.recv()
-                # Process the received message
                 logger.info(f"{self.charger_id} ^ : {message}")
 
-                # Now, if this is an OCPP CallResult (3) or CallError (4), we need to send it back to the 
-                # CSMS (primary or secondary) that issued the command
                 [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
 
-                # If it is a Call (2), we will send it to both primary and secondary (if connected)
                 if message_type == OCPPMessageType.Call:
-                    await self.primary_connection.send(message)
-                    if self.secondary_connection:
-                        await self.secondary_connection.send(message)
-                elif message_type == OCPPMessageType.CallResult or message_type == OCPPMessageType.CallError:
+                    j = json.loads(message)
+                    action = j[2]
+                    payload = j[3]
+
+                    # Check RFID on Authorize/StartTransaction
+                    if action in ["Authorize", "StartTransaction"]:
+                        id_tag = payload.get("idTag")
+                        if id_tag == self.primary_rfid:
+                            self.session_target = "primary"
+                            logger.info(f"{self.charger_id} Session locked to PRIMARY (RFID {id_tag})")
+                        elif id_tag == self.secondary_rfid:
+                            self.session_target = "secondary"
+                            logger.info(f"{self.charger_id} Session locked to SECONDARY (RFID {id_tag})")
+                        else:
+                            self.session_target = "primary"
+                            logger.info(f"{self.charger_id} Session defaulted to PRIMARY (RFID {id_tag})")
+
+                    # Forward based on chosen target
+                    if self.session_target == "secondary":
+                        if self.secondary_connection:
+                            await self.secondary_connection.send(message)
+                    else:
+                        await self.primary_connection.send(message)
+
+                elif message_type in (OCPPMessageType.CallResult, OCPPMessageType.CallError):
                     if message_id in self.primary_call_ids:
                         logger.info(f"{self.charger_id} ^ : Result/Error forwarded to primary")
                         self.primary_call_ids.remove(message_id)
@@ -182,9 +199,12 @@ class OCPP2WProxy:
                     elif message_id in self.secondary_call_ids:
                         logger.info(f"{self.charger_id} ^ : Result/Error forwarded to secondary")
                         self.secondary_call_ids.remove(message_id)
-                        await self.secondary_connection.send(message)
+                        if self.secondary_connection:
+                            await self.secondary_connection.send(message)
                     else:
-                        logger.error(f"{self.charger_id} ^: Received CallResult/CallError against unknown message id {message_id}")
+                        logger.error(
+                            f"{self.charger_id} ^: Received CallResult/CallError against unknown message id {message_id}"
+                        )
                 else:
                     logger.error(f"{self.charger_id} ^: Unknown message type {message_type}")
         except Exception as e:
@@ -193,16 +213,13 @@ class OCPP2WProxy:
     async def receive_primary_messages(self):
         try:
             while True:
-                # Wait for a message from the primary server
                 message = await self.primary_connection.recv()
                 logger.info(f"{self.charger_id} v (prim) : {message}")
 
                 [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
                 if message_type == OCPPMessageType.Call:
-                    # Record the message_id 
                     self.primary_call_ids.add(message_id)
 
-                # Send message to the charger
                 await self.ws.send(message)
         except Exception as e:
             logger.error(f"{self.charger_id} Error in receive_primary_messages: {e}")
@@ -210,64 +227,49 @@ class OCPP2WProxy:
     async def receive_secondary_messages(self):
         try:
             while True:
-                # Wait for a message from the secondary server
                 message = await self.secondary_connection.recv()
                 logger.info(f"{self.charger_id} v (sec) : {message}")
 
                 [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
                 if message_type == OCPPMessageType.Call:
-                    # Record the message_id 
                     self.secondary_call_ids.add(message_id)
-                    # Send it to the charger
-                    await self.ws.send(message) 
-                # Note! We do not forward CallResults or CallErrors from the secondary server
-                # These are silently ignored.
+                    await self.ws.send(message)
+                # Note: CallResults/Errors from secondary are ignored
         except Exception as e:
-            logger.error(f"{self.charger_id} Error in receive_primary_messages: {e}")
+            logger.error(f"{self.charger_id} Error in receive_secondary_messages: {e}")
 
     async def watchdog(self):
-        """Watch time vs. timestamp updated by receiving messages from charger."""
+        """Watchdog on charger messages."""
         while True:
-            # And ... sleep
-            await asyncio.sleep(config.getint("host", "watchdog_interval", 30))
-
+            await asyncio.sleep(config.getint("host", "watchdog_interval", fallback=30))
             elapsed = time.time() - self._last_charger_update
-            if elapsed > config.getint("host", "watchdog_stale", 300):
-                logger.error(f"{self.charger_id} Watch dog no for {elapsed} seconds. Closing connections")
+            if elapsed > config.getint("host", "watchdog_stale", fallback=300):
+                logger.error(f"{self.charger_id} Watchdog timeout {elapsed} sec. Closing connections")
                 return
 
-# Connection handler (charger connects)
+# Connection handler
 async def on_connect(websocket: websockets.asyncio.server.ServerConnection):
-    logger.debug('Connection request', websocket.request)
-    # Determine charger_id (final part of path)
     path = websocket.request.path
     charger_id = path.strip("/")
-    logger.info(f'{charger_id} connection request')
+    logger.info(f"{charger_id} connection request")
 
     try:
-        # Delete any existing charger setup
         if charger_id in OCPP2WProxy.proxy_list:
             await OCPP2WProxy.proxy_list[charger_id].close()
             del OCPP2WProxy.proxy_list[charger_id]
 
-        # Setup
         proxy = OCPP2WProxy(websocket=websocket, charger_id=charger_id)
-
-        # Connect and run proxy operations
         await proxy.run()
 
     except Exception as e:
-        logger.error(f'{charger_id} Error creating OCPP2WProxy: {e}')
+        logger.error(f"{charger_id} Error creating OCPP2WProxy: {e}")
     finally:
-        logger.info("f{charger_id} closed/done")
+        logger.info(f"{charger_id} closed/done")
 
-
-# Main. Decode arguments, setup handler
+# Main
 async def main():
-    parser = argparse.ArgumentParser(
-        description='ocpp-2w-proxy: A two way OCPP proxy')
-    parser.add_argument('--version', action='version',
-                        version=f'%(prog)s {__version__}')
+    parser = argparse.ArgumentParser(description="ocpp-2w-proxy: A two way OCPP proxy")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
         "--config",
         type=str,
@@ -276,7 +278,6 @@ async def main():
     )
     args = parser.parse_args()
 
-    # Read config. config object is then available (via config import) to all.
     logger.warning(f"Reading config from {args.config}")
     config.read(args.config)
 
@@ -285,14 +286,11 @@ async def main():
         logger.warning(f'Setting log level for {logger_name} to {config.get("logging", logger_name)}')
         logging.getLogger(logger_name).setLevel(level=config.get("logging", logger_name))
 
-    # Get host config
     host = config.get("host", "addr")
     port = config.get("host", "port")
     cert_chain = config.get("host", "cert_chain", fallback=None)
     cert_key = config.get("host", "cert_key", fallback=None)
-    logger.debug(f"host: {host}, port: {port}, cert_chain: {cert_chain}, cert_key: {cert_key}")
 
-    # Start server, either ws:// or wss://
     if cert_chain and cert_key:
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_context.load_cert_chain(certfile=cert_chain, keyfile=cert_key)
@@ -315,7 +313,6 @@ async def main():
 
     logger.info("Proxy ready. Waiting for new connections...")
     await server.wait_closed()
-
 
 if __name__ == "__main__":
     try:
